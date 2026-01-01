@@ -1,13 +1,26 @@
-﻿public record Result<T>(T? Data, string? Message = "SUCCESS", string? Code = "0")
+﻿public class Result
 {
-    public static Result<T> Success(T data) => new(data);
-    public static Result<T> Success() => new(default(T?));
-    public static Result<T> Failure(string code, string message) => new(default, message, code);
+    protected Result(Error? error)
+    {
+        Error = error;
+    }
+
+
+    public Error? Error { get; }
+
+    public static Result Success() => new(null);
+    public static Result Failure(Error error) => new(error);
 }
 
-public record Result(string? Message = "SUCCESS", string? Code = "0")
+public sealed class Result<T> : Result
 {
-    public static Result Success() => new();
+    private Result(bool isSuccess, T? value, Error? error) : base(error)
+    {
+        Value = value;
+    }
 
-    public static Result Failure(string code, string message) => new(message, code);
+    public T? Value { get; }
+
+    public static Result<T> Success(T value) => new(true, value, null);
+    public static new Result<T> Failure(Error error) => new(false, default, error);
 }

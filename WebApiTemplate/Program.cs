@@ -106,17 +106,7 @@ app.UseSerilogRequestLogging(opts =>
     opts.EnrichDiagnosticContext = (diag, ctx) =>
     {
         // 優先使用 X-Request-Id header，若不存在或為空則使用 TraceIdentifier
-        string requestId = string.Empty;
-        if (ctx.Request?.Headers != null && ctx.Request.Headers.TryGetValue("X-Request-Id", out var headerValues))
-        {
-            requestId = headerValues.ToString();
-        }
-
-        if (string.IsNullOrWhiteSpace(requestId))
-        {
-            requestId = ctx.TraceIdentifier;
-        }
-
+        string requestId = RequestIdHelper.GetRequestId(ctx);
         diag.Set("RequestId", requestId);
 
         var activity = ctx.Features.Get<IHttpActivityFeature>()?.Activity ?? Activity.Current;
