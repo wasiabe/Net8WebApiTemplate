@@ -1,38 +1,74 @@
 global using Serilog;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
-using Microsoft.AspNetCore.HttpLogging;
-using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.Extensions.Options;
+using Serilog.Events;
 using System.Diagnostics;
-using System.Net;
 using System.Threading.RateLimiting;
+
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Serilog 配置
+// Serilog 配置: Read configuration from appsettings.json
 Log.Logger = new LoggerConfiguration()
-    .WriteTo.Console()
-    .Enrich.FromLogContext()
-    .CreateLogger();
+    .ReadFrom.Configuration(builder.Configuration).CreateLogger();
 
-builder.Host.UseSerilog();
+//Redirect all log events through Serilog pipeline.
+builder.Host.UseSerilog((ctx, services, cfg) =>
+{
+    cfg.ReadFrom.Configuration(ctx.Configuration)
+       .ReadFrom.Services(services)
+       .Enrich.FromLogContext()
+       .Enrich.With<RequestIdEnricher>();
+
+    var httpAccessor = services.GetRequiredService<IHttpContextAccessor>();
+    cfg.Enrich.With(new TraceIdEnricher(httpAccessor));
+});
+
+// 設定 Options 
+builder.Services.AddOptions<IpAllowlistOptions>()
+    .Bind(builder.Configuration.GetSection(IpAllowlistOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+builder.Services.AddOptions<RateLimitOptions>()
+    .Bind(builder.Configuration.GetSection(RateLimitOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
 
 // 資料庫字串 (從環境變數或 Secret 讀取，避免明碼)
 // 範例：export ConnectionStrings__DefaultConnection="YourRealPassword"
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
-// 3. Rate Limiting 限流配置
+// Forwarded headers
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor
+                             | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto;
+    // NOTE: In production, restrict KnownNetworks / KnownProxies!
+});
+
+// Rate Limiting 限流配置
 builder.Services.AddRateLimiter(options =>
 {
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
-        RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: httpContext.User.Identity?.Name ?? httpContext.Request.Headers.Host.ToString(),
-            factory: partition => new FixedWindowRateLimiterOptions
+    {
+        var rateCfg = httpContext.RequestServices.GetRequiredService<IOptions<RateLimitOptions>>().Value;
+        var ipCfg = httpContext.RequestServices.GetRequiredService<IOptions<IpAllowlistOptions>>().Value;
+
+        var clientIp = ClientIpResolver.GetClientIp(httpContext, ipCfg) ?? "unknown";
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: clientIp,
+            factory: _ => new FixedWindowRateLimiterOptions
             {
-                AutoReplenishment = true,
-                PermitLimit = 100,
-                Window = TimeSpan.FromMinutes(1)
-            }));
+                PermitLimit = rateCfg.PermitLimit,
+                Window = TimeSpan.FromSeconds(rateCfg.WindowSeconds),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = rateCfg.QueueLimit
+            });
+    });
+
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 });
 
 // 註冊自定義錯誤處理器
@@ -46,7 +82,50 @@ builder.Services.AddHttpContextAccessor();
 
 builder.Services.AddControllers();
 builder.Services.AddSwaggerGen();
+
+// 註冊 IP 卡控 Middleware (自定義實作) <- 移到 Build 之前
+builder.Services.AddTransient<IpAllowlistMiddleware>();
+
 var app = builder.Build();
+
+// 啟用 Forwarded Headers
+// 必須放在其他 Middleware（如 Authentication, StaticFiles）之前
+app.UseForwardedHeaders();
+
+app.UseSerilogRequestLogging(opts =>
+{
+    opts.GetLevel = (httpContext, elapsed, ex) =>
+        ex is not null || httpContext.Response.StatusCode >= 500 ? LogEventLevel.Error
+        : httpContext.Response.StatusCode >= 400 ? LogEventLevel.Warning
+        : LogEventLevel.Information;
+
+    opts.EnrichDiagnosticContext = (diag, ctx) =>
+    {
+        // 優先使用 X-Request-Id header，若不存在或為空則使用 TraceIdentifier
+        string requestId = string.Empty;
+        if (ctx.Request?.Headers != null && ctx.Request.Headers.TryGetValue("X-Request-Id", out var headerValues))
+        {
+            requestId = headerValues.ToString();
+        }
+
+        if (string.IsNullOrWhiteSpace(requestId))
+        {
+            requestId = ctx.TraceIdentifier;
+        }
+
+        diag.Set("RequestId", requestId);
+
+        var activity = ctx.Features.Get<IHttpActivityFeature>()?.Activity ?? Activity.Current;
+        diag.Set("TraceId", activity?.Id);
+
+        var ipCfg = ctx.RequestServices.GetRequiredService<IOptions<IpAllowlistOptions>>().Value;
+        diag.Set("ClientIp", ClientIpResolver.GetClientIp(ctx, ipCfg));
+
+        diag.Set("Path", ctx.Request?.Path.Value);
+        diag.Set("Method", ctx.Request?.Method);
+        diag.Set("StatusCode", ctx.Response.StatusCode);
+    };
+});
 
 if (app.Environment.IsDevelopment())
 {
@@ -54,11 +133,14 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-// IP 卡控 Middleware (自定義實作)
-app.UseMiddleware<IpFilteringMiddleware>();
+// 使用已註冊的 IMiddleware 實例
+app.UseMiddleware<IpAllowlistMiddleware>();
 
 app.UseRateLimiter();
-app.UseExceptionHandler(); // 使用 IExceptionHandler
+
+// 使用 IExceptionHandler
+app.UseExceptionHandler(); 
+
 app.MapControllers();
 
 app.Run();
