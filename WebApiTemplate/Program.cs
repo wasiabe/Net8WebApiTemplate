@@ -81,6 +81,10 @@ builder.Services.AddProblemDetails();
 builder.Services.AddHttpContextAccessor();  
 
 builder.Services.AddControllers();
+
+//探索API
+builder.Services.AddEndpointsApiExplorer();
+//產生Swagger文件:/swagger/v1/swagger.json
 builder.Services.AddSwaggerGen();
 
 // 註冊 IP 卡控 Middleware (自定義實作) <- 移到 Build 之前
