@@ -1,5 +1,6 @@
 global using Serilog;
 using Microsoft.AspNetCore.Http.Features;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Serilog.Events;
 using System.Diagnostics;
@@ -34,10 +35,6 @@ builder.Services.AddOptions<RateLimitOptions>()
     .Bind(builder.Configuration.GetSection(RateLimitOptions.SectionName))
     .ValidateDataAnnotations()
     .ValidateOnStart();
-
-// 資料庫字串 (從環境變數或 Secret 讀取，避免明碼)
-// 範例：export ConnectionStrings__DefaultConnection="YourRealPassword"
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
 // Forwarded headers
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
@@ -90,6 +87,20 @@ builder.Services.AddSwaggerGen();
 // 註冊 IP 卡控 Middleware (自定義實作) <- 移到 Build 之前
 builder.Services.AddTransient<IpAllowlistMiddleware>();
 
+// 注入資料庫服務
+builder.Services.AddDbContext<AppDbContext>(opt =>
+    opt.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// 注入Web API Log服務
+builder.Services.Configure<WebApiRequestLogOptions>(
+    builder.Configuration.GetSection("WebApiRequestLog"));
+builder.Services.AddScoped<IWebApiRequestLogRepository, WebApiRequestLogRepository>();
+builder.Services.AddScoped<WebApiRequestLogMiddleware>();
+
+// 批次寫入LOG
+builder.Services.AddSingleton(new WebApiRequestLogQueue(capacity: 5000));
+builder.Services.AddHostedService<WebApiRequestLogWriterService>();
+
 var app = builder.Build();
 
 // 啟用 Forwarded Headers
@@ -106,7 +117,7 @@ app.UseSerilogRequestLogging(opts =>
     opts.EnrichDiagnosticContext = (diag, ctx) =>
     {
         // 優先使用 X-Request-Id header，若不存在或為空則使用 TraceIdentifier
-        string requestId = RequestIdHelper.GetRequestId(ctx);
+        string requestId = RequestHelper.GetRequestId(ctx);
         diag.Set("RequestId", requestId);
 
         var activity = ctx.Features.Get<IHttpActivityFeature>()?.Activity ?? Activity.Current;
@@ -127,13 +138,17 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
+// Web API Log Middleware: 一定要在全域例外處理之前
+app.UseMiddleware<WebApiRequestLogMiddleware>();
+
+// 全域例外處理
+app.UseExceptionHandler();
+
 // 使用已註冊的 IMiddleware 實例
 app.UseMiddleware<IpAllowlistMiddleware>();
 
+// 限流
 app.UseRateLimiter();
-
-// 使用 IExceptionHandler
-app.UseExceptionHandler(); 
 
 app.MapControllers();
 
