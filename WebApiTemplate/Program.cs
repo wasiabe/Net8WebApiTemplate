@@ -13,6 +13,10 @@ var builder = WebApplication.CreateBuilder(args);
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration).CreateLogger();
 
+//在 非 Controller 的地方 也能存取目前的 HTTP Request, 例如 Middleware, Service, Logging
+// 在 Host.UseSerilog 之前註冊 IHttpContextAccessor，讓 Serilog 的啟動委派能安全解析它
+builder.Services.AddHttpContextAccessor();
+
 //Redirect all log events through Serilog pipeline.
 builder.Host.UseSerilog((ctx, services, cfg) =>
 {
@@ -73,9 +77,6 @@ builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 
 // 使用準化錯誤回應格式 RFC 9457
 builder.Services.AddProblemDetails();
-
-//在 非 Controller 的地方 也能存取目前的 HTTP Request, 例如 Middleware, Service, Logging
-builder.Services.AddHttpContextAccessor();  
 
 builder.Services.AddControllers();
 
